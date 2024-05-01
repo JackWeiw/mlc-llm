@@ -24,12 +24,14 @@ class EagleNewRequestPrefillActionObj : public EngineActionObj {
   explicit EagleNewRequestPrefillActionObj(Array<Model> models, LogitProcessor logit_processor,
                                            Sampler sampler,
                                            std::vector<ModelWorkspace> model_workspaces,
+                                           DraftTokenWorkspaceManager draft_token_workspace_manager,
                                            EngineConfig engine_config,
                                            Optional<EventTraceRecorder> trace_recorder)
       : models_(std::move(models)),
         logit_processor_(std::move(logit_processor)),
         sampler_(std::move(sampler)),
         model_workspaces_(std::move(model_workspaces)),
+        draft_token_workspace_manager_(std::move(draft_token_workspace_manager)),
         engine_config_(std::move(engine_config)),
         trace_recorder_(std::move(trace_recorder)) {}
 
@@ -81,8 +83,8 @@ class EagleNewRequestPrefillActionObj : public EngineActionObj {
     // - Get embedding and run prefill for each model.
     std::vector<int> prefill_lengths;
     prefill_lengths.resize(/*size=*/num_rsentries, /*value=*/-1);
-    NDArray hidden_states_for_input{nullptr};
-    NDArray hidden_states_for_sample{nullptr};
+    ObjectRef hidden_states_for_input{nullptr};
+    ObjectRef hidden_states_for_sample{nullptr};
     NDArray logits_for_sample{nullptr};
     // A map used to record the entry and child_idx pair needed to fork sequence.
     // The base model (id 0) should record all the pairs and all the small models
@@ -107,7 +109,7 @@ class EagleNewRequestPrefillActionObj : public EngineActionObj {
         }
 
         ICHECK(mstate->draft_output_tokens.empty());
-        ICHECK(mstate->draft_output_prob_dist.empty());
+        ICHECK(mstate->draft_token_slots.empty());
         if (status_before_prefill[i] == RequestStateStatus::kPending) {
           // Add the sequence to the model, or fork the sequence from its parent.
           if (rsentry->parent_idx == -1) {
@@ -165,14 +167,17 @@ class EagleNewRequestPrefillActionObj : public EngineActionObj {
       }
 
       RECORD_EVENT(trace_recorder_, request_ids, "start prefill");
-      ObjectRef fused_hidden_states = models_[model_id]->FuseEmbedHidden(
-          embeddings, hidden_states_for_input, /*batch_size*/ 1, /*seq_len*/ cum_prefill_length);
-      NDArray hidden_states = models_[model_id]->BatchPrefillToLastHidden(
-          fused_hidden_states, request_internal_ids, prefill_lengths);
+      ObjectRef embedding_or_hidden_states{nullptr};
+      if (model_id == 0) {
+        embedding_or_hidden_states = embeddings;
+      } else {
+        embedding_or_hidden_states = models_[model_id]->FuseEmbedHidden(
+            embeddings, hidden_states_for_input, /*batch_size*/ 1, /*seq_len*/ cum_prefill_length);
+      }
+      // hidden_states: (b * s, h)
+      ObjectRef hidden_states = models_[model_id]->BatchPrefillToLastHidden(
+          embedding_or_hidden_states, request_internal_ids, prefill_lengths);
       RECORD_EVENT(trace_recorder_, request_ids, "finish prefill");
-      ICHECK_EQ(hidden_states->ndim, 3);
-      ICHECK_EQ(hidden_states->shape[0], 1);
-      ICHECK_EQ(hidden_states->shape[1], cum_prefill_length);
 
       if (model_id == 0) {
         // We only need to sample for model 0 in prefill.
@@ -181,14 +186,23 @@ class EagleNewRequestPrefillActionObj : public EngineActionObj {
 
       // Whether to use base model to get logits.
       int sample_model_id = !models_[model_id]->CanGetLogits() ? 0 : model_id;
-      hidden_states_for_sample = models_[sample_model_id]->BatchSelectLastHidden(
-          hidden_states, request_internal_ids, prefill_lengths);
+
+      std::vector<int> logit_positions;
+      {
+        // Prepare the logit positions
+        logit_positions.reserve(prefill_lengths.size());
+        int total_len = 0;
+        for (int i = 0; i < prefill_lengths.size(); ++i) {
+          total_len += prefill_lengths[i];
+          logit_positions.push_back(total_len - 1);
+        }
+      }
+      // hidden_states_for_sample: (b * s, h)
+      hidden_states_for_sample = models_[sample_model_id]->GatherHiddenStates(
+          hidden_states, logit_positions, &model_workspaces_[model_id].hidden_states);
+      // logits_for_sample: (b * s, v)
       logits_for_sample =
           models_[sample_model_id]->GetLogits(hidden_states_for_sample, 1, num_rsentries);
-      ICHECK_EQ(hidden_states_for_sample->ndim, 3);
-      ICHECK_EQ(hidden_states_for_sample->shape[0], 1);
-      ICHECK_EQ(hidden_states_for_sample->shape[1], num_rsentries);
-
       // - Update logits.
       ICHECK(logits_for_sample.defined());
       Array<GenerationConfig> generation_cfg;
@@ -276,18 +290,18 @@ class EagleNewRequestPrefillActionObj : public EngineActionObj {
           rsentry_activated.push_back(true);
         }
       }
-      std::vector<NDArray> prob_dist;
+
       NDArray renormalized_probs = sampler_->BatchRenormalizeProbsByTopP(
           probs_on_device, sample_indices, request_ids, generation_cfg);
       std::vector<SampleResult> sample_results = sampler_->BatchSampleTokensWithProbAfterTopP(
-          renormalized_probs, sample_indices, request_ids, generation_cfg, rngs, &prob_dist);
+          renormalized_probs, sample_indices, request_ids, generation_cfg, rngs);
       ICHECK_EQ(sample_results.size(), rsentries_for_sample.size());
 
       // - Update the committed tokens of states.
       // - If a request is first-time prefilled, set the prefill finish time.
       auto tnow = std::chrono::high_resolution_clock::now();
-      for (int i = 0; i < static_cast<int>(rsentries_for_sample.size()); ++i) {
-        if (model_id == 0) {
+      if (model_id == 0) {
+        for (int i = 0; i < static_cast<int>(rsentries_for_sample.size()); ++i) {
           for (int mid = 0; mid < static_cast<int>(models_.size()); ++mid) {
             rsentries_for_sample[i]->mstates[mid]->CommitToken(sample_results[i]);
             if (!rsentry_activated[i]) {
@@ -301,13 +315,20 @@ class EagleNewRequestPrefillActionObj : public EngineActionObj {
           if (rsentries_for_sample[i]->mstates[0]->committed_tokens.size() == 1) {
             rsentries_for_sample[i]->tprefill_finish = tnow;
           }
-        } else {
-          // - Slice hidden_states_for_sample
-          NDArray last_hidden_on_device = GetTokenHidden(hidden_states_for_sample, i);
-          CHECK(i < static_cast<int>(prob_dist.size()));
-          CHECK(prob_dist[i].defined());
-          rsentries_for_sample[i]->mstates[model_id]->AddDraftToken(sample_results[i], prob_dist[i],
-                                                                    last_hidden_on_device);
+        }
+      } else {
+        // - Slice and save hidden_states_for_sample
+        draft_token_workspace_manager_->AllocSlots(rsentries_for_sample.size(),
+                                                   &draft_token_slots_);
+        models_[model_id]->ScatterDraftProbs(renormalized_probs, draft_token_slots_,
+                                             &model_workspaces_[0].draft_probs_storage);
+        if (engine_config_->spec_draft_length > 1) {
+          models_[model_id]->ScatterHiddenStates(hidden_states_for_sample, draft_token_slots_,
+                                                 &model_workspaces_[0].draft_hidden_states_storage);
+        }
+        for (int i = 0; i < static_cast<int>(rsentries_for_sample.size()); ++i) {
+          rsentries_for_sample[i]->mstates[model_id]->AddDraftToken(sample_results[i],
+                                                                    draft_token_slots_[i]);
           estate->stats.total_draft_length += 1;
         }
       }
@@ -554,26 +575,6 @@ class EagleNewRequestPrefillActionObj : public EngineActionObj {
     ICHECK(false) << "Cannot reach here";
   }
 
-  /*!
-   * \brief Get one item from a hidden_states array, which corresponds to the last token.
-   * \param hidden_states The hidden_states of all the tokens.
-   * \param token_pos The desired token position in the sequence.
-   * \return The desired token's hidden_states
-   */
-  NDArray GetTokenHidden(NDArray hidden_states, int token_pos) {
-    ICHECK_EQ(hidden_states->ndim, 3);
-    NDArray last_hidden_on_device =
-        NDArray::Empty({hidden_states->shape[2]}, hidden_states->dtype, hidden_states->device);
-
-    int64_t ndata = hidden_states->shape[2];
-    const int16_t* __restrict p_hidden =
-        static_cast<int16_t*>(__builtin_assume_aligned(hidden_states->data, 2)) +
-        (token_pos * ndata);
-
-    last_hidden_on_device.CopyFromBytes(p_hidden, ndata * sizeof(int16_t));
-    return last_hidden_on_device;
-  }
-
   /*! \brief The models to run prefill in. */
   Array<Model> models_;
   /*! \brief The logit processor. */
@@ -582,20 +583,25 @@ class EagleNewRequestPrefillActionObj : public EngineActionObj {
   Sampler sampler_;
   /*! \brief Workspace of each model. */
   std::vector<ModelWorkspace> model_workspaces_;
+  /*! \brief The draft token workspace manager. */
+  DraftTokenWorkspaceManager draft_token_workspace_manager_;
   /*! \brief The engine config. */
   EngineConfig engine_config_;
   /*! \brief Event trace recorder. */
   Optional<EventTraceRecorder> trace_recorder_;
+  /*! \brief Temporary buffer to store the slots of the current draft tokens */
+  std::vector<int> draft_token_slots_;
 };
 
-EngineAction EngineAction::EagleNewRequestPrefill(Array<Model> models,
-                                                  LogitProcessor logit_processor, Sampler sampler,
-                                                  std::vector<ModelWorkspace> model_workspaces,
-                                                  EngineConfig engine_config,
-                                                  Optional<EventTraceRecorder> trace_recorder) {
+EngineAction EngineAction::EagleNewRequestPrefill(
+    Array<Model> models, LogitProcessor logit_processor, Sampler sampler,
+    std::vector<ModelWorkspace> model_workspaces,
+    DraftTokenWorkspaceManager draft_token_workspace_manager, EngineConfig engine_config,
+    Optional<EventTraceRecorder> trace_recorder) {
   return EngineAction(make_object<EagleNewRequestPrefillActionObj>(
       std::move(models), std::move(logit_processor), std::move(sampler),
-      std::move(model_workspaces), std::move(engine_config), std::move(trace_recorder)));
+      std::move(model_workspaces), std::move(draft_token_workspace_manager),
+      std::move(engine_config), std::move(trace_recorder)));
 }
 
 }  // namespace serve

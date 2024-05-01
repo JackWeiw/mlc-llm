@@ -35,10 +35,11 @@ class ThreadedEngine {
 
   /*!
    * \brief Initialize the threaded engine from packed arguments in TVMArgs.
+   * \param device The device where to run models.
    * \param request_stream_callback The request stream callback function to.
    * \param trace_recorder Event trace recorder for requests.
    */
-  virtual void InitBackgroundEngine(Optional<PackedFunc> request_stream_callback,
+  virtual void InitBackgroundEngine(Device device, Optional<PackedFunc> request_stream_callback,
                                     Optional<EventTraceRecorder> trace_recorder) = 0;
 
   /*!
@@ -76,6 +77,9 @@ class ThreadedEngine {
 
   /*! \brief Call the given global function on all workers. Only for debug purpose. */
   virtual void DebugCallFuncOnAllAllWorker(const String& func_name) = 0;
+
+  /*! \brief Print the statistics of the engine. */
+  virtual String Stats() = 0;
 };
 
 }  // namespace serve

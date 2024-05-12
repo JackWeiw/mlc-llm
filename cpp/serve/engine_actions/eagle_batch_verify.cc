@@ -114,16 +114,12 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
     RECORD_EVENT(trace_recorder_, request_ids, "start verify");
     ObjectRef hidden_states = models_[verify_model_id_]->BatchVerifyToLastHidden(
         embeddings, request_internal_ids, verify_lengths);
-    NDArray logits =
-        models_[verify_model_id_]->GetLogits(hidden_states, 1, cum_verify_lengths[num_rsentries]);
+    NDArray logits = models_[verify_model_id_]->GetLogits(hidden_states);
     RECORD_EVENT(trace_recorder_, request_ids, "finish verify");
-    ICHECK_EQ(logits->ndim, 3);
-    ICHECK_EQ(logits->shape[0], 1);
-    ICHECK_EQ(logits->shape[1], cum_verify_lengths[num_rsentries]);
+    ICHECK_EQ(logits->ndim, 2);
+    ICHECK_EQ(logits->shape[0], cum_verify_lengths.back());
 
     // - Update logits.
-    logits =
-        logits.CreateView({cum_verify_lengths[num_rsentries], logits->shape[2]}, logits->dtype);
     logit_processor_->InplaceUpdateLogits(logits, generation_cfg, verify_request_mstates,
                                           request_ids, &cum_verify_lengths, &draft_output_tokens);
 
@@ -139,6 +135,13 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
             renormalized_probs, request_ids, cum_verify_lengths, generation_cfg, rngs,
             draft_output_tokens, draft_probs_on_device);
     ICHECK_EQ(sample_results_arr.size(), num_rsentries);
+
+    // We collect the requests whose drafts are fully accepted.
+    // When a request's draft is fully accepted, there is an extra token proposed
+    // by the draft model but not added into the draft model's KV cache.
+    // In this case, an additional batch decode step is needed for these requests.
+    std::vector<int64_t> fully_accepted_rsentries;
+    fully_accepted_rsentries.reserve(num_rsentries);
 
     std::vector<int> last_accepted_hidden_positions;
     last_accepted_hidden_positions.reserve(num_rsentries);
@@ -157,6 +160,7 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
       // - Take max with 0 in case of all accepted.
       int rollback_length =
           std::max(cum_verify_lengths[i + 1] - cum_verify_lengths[i] - accept_length, 0);
+
       // rollback kv cache
       // NOTE: when number of small models is more than 1 (in the future),
       // it is possible to re-compute prefill for the small models.
@@ -166,6 +170,8 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
         // Draft model rollback minus one because verify uses one more token.
         models_[draft_model_id_]->PopNFromKVCache(
             rsentries[i]->mstates[draft_model_id_]->internal_id, rollback_length - 1);
+      } else {
+        fully_accepted_rsentries.push_back(i);
       }
       // clear the draft model state entries
       rsentries[i]->mstates[draft_model_id_]->RemoveAllDraftTokens(&draft_token_slots_);
@@ -173,7 +179,62 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
       // - Slice and save hidden_states_for_sample
       last_accepted_hidden_positions.push_back(cum_verify_lengths[i] + accept_length - 1);
     }
+    if (!fully_accepted_rsentries.empty()) {
+      // - Run a step of batch decode for requests whose drafts are fully accepted.
+      // When a request's draft is fully accepted, there is an extra token proposed
+      // by the draft model but not added into the draft model's KV cache.
+      // In this case, an additional batch decode step is needed for these requests.
+      std::vector<int> input_tokens;
+      std::vector<int64_t> fully_accepted_request_internal_ids;
+      input_tokens.reserve(fully_accepted_rsentries.size());
+      fully_accepted_request_internal_ids.reserve(fully_accepted_rsentries.size());
 
+      std::vector<int> hidden_states_positions_for_fully_accepted;
+      hidden_states_positions_for_fully_accepted.reserve(fully_accepted_rsentries.size());
+
+      for (int rsentry_id : fully_accepted_rsentries) {
+        int num_committed_tokens =
+            rsentries[rsentry_id]->mstates[verify_model_id_]->committed_tokens.size();
+        // When a request's draft is fully accepted, an additional new token is sampled.
+        // So the token needed to fill in the draft model is the committed_token[-2].
+        ICHECK_GE(num_committed_tokens, 2);
+        input_tokens.push_back(rsentries[rsentry_id]
+                                   ->mstates[verify_model_id_]
+                                   ->committed_tokens[num_committed_tokens - 2]
+                                   .sampled_token_id.first);
+
+        // Taking the hidden states of the token before the last token
+        hidden_states_positions_for_fully_accepted.push_back(
+            last_accepted_hidden_positions[rsentry_id] - 1);
+        fully_accepted_request_internal_ids.push_back(
+            rsentries[rsentry_id]->mstates[draft_model_id_]->internal_id);
+      }
+
+      // - Compute embeddings.
+      ObjectRef embeddings = models_[draft_model_id_]->TokenEmbed(
+          {IntTuple{input_tokens.begin(), input_tokens.end()}});
+      // - Gather hidden states
+      ObjectRef hidden_states_for_fully_accepted = models_[draft_model_id_]->GatherHiddenStates(
+          hidden_states, hidden_states_positions_for_fully_accepted,
+          &model_workspaces_[draft_model_id_].hidden_states);
+      // - Invoke model decode.
+      ObjectRef fused_embedding_hidden_states =
+          models_[draft_model_id_]->FuseEmbedHidden(embeddings, hidden_states_for_fully_accepted,
+                                                    /*batch_size*/ num_rsentries, /*seq_len*/ 1);
+      hidden_states_for_fully_accepted = models_[draft_model_id_]->BatchDecodeToLastHidden(
+          fused_embedding_hidden_states, request_internal_ids);
+      // - We explicitly synchronize to avoid the input tokens getting overriden in the
+      // next runs of BatchDecode.
+      // This is because we do not do sample for this round of batch decode.
+      if (hidden_states_for_fully_accepted->IsInstance<DRefObj>()) {
+        Downcast<Session>(Downcast<DRef>(hidden_states_for_fully_accepted)->session)->SyncWorker(0);
+      } else {
+        NDArray hidden_states_for_fully_accepted_nd =
+            Downcast<NDArray>(hidden_states_for_fully_accepted);
+        TVMSynchronize(hidden_states_for_fully_accepted_nd->device.device_type,
+                       hidden_states_for_fully_accepted_nd->device.device_id, nullptr);
+      }
+    }
     {
       // One step draft for the following steps
 
@@ -208,19 +269,16 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
           fused_embedding_hidden_states, request_internal_ids);
 
       if (models_[draft_model_id_]->CanGetLogits()) {
-        logits = models_[draft_model_id_]->GetLogits(hidden_states, /*batch_size*/ num_rsentries,
-                                                     /*seq_len*/ 1);
+        logits = models_[draft_model_id_]->GetLogits(hidden_states);
       } else {
         // - Use base model's head.
-        logits = models_[0]->GetLogits(hidden_states, /*batch_size*/ num_rsentries, /*seq_len*/ 1);
+        logits = models_[0]->GetLogits(hidden_states);
       }
       RECORD_EVENT(trace_recorder_, request_ids, "finish proposal decode");
-      ICHECK_EQ(logits->ndim, 3);
+      ICHECK_EQ(logits->ndim, 2);
       ICHECK_EQ(logits->shape[0], num_rsentries);
-      ICHECK_EQ(logits->shape[1], 1);
 
       // - Update logits.
-      logits = logits.CreateView({num_rsentries, logits->shape[2]}, logits->dtype);
       logit_processor_->InplaceUpdateLogits(logits, generation_cfg, mstates, request_ids);
 
       // - Compute probability distributions.

@@ -125,7 +125,7 @@ class ModelImpl : public ModelObj {
     return ft_.get_logits_func_.defined() && ft_.batch_get_logits_func_.defined();
   }
 
-  NDArray GetLogits(const ObjectRef& hidden_states, int batch_size, int seq_len) final {
+  NDArray GetLogits(const ObjectRef& hidden_states) final {
     NVTXScopedRange nvtx_scope("GetLogits");
     CHECK(ft_.get_logits_func_.defined()) << "`get_logits` function is not found in the model.";
 
@@ -139,18 +139,14 @@ class ModelImpl : public ModelObj {
     if (trace_enabled_) {
       TVMSynchronize(device_.device_type, device_.device_id, nullptr);
     }
-
     NDArray logits{nullptr};
     if (ft_.use_disco) {
       logits = Downcast<DRef>(ret)->DebugGetFromRemote(0);
     } else {
       logits = Downcast<NDArray>(ret);
     }
-    CHECK(logits.defined());
     // logits: (b * s, v)
-    ICHECK_EQ(logits->ndim, 2);
-    ICHECK_EQ(logits->shape[0], batch_size * seq_len);
-    return logits.CreateView({batch_size, seq_len, logits->shape[1]}, logits->dtype);
+    return logits;
   }
 
   ObjectRef FuseEmbedHidden(const ObjectRef& embeddings, const ObjectRef& previous_hidden_states,
@@ -334,7 +330,7 @@ class ModelImpl : public ModelObj {
   }
 
   NDArray BatchDecode(const ObjectRef& embeddings, const std::vector<int64_t>& seq_ids) final {
-    NVTXScopedRange nvtx_scope("BatchDecode");
+    NVTXScopedRange nvtx_scope("BatchDecode num_seqs=" + std::to_string(seq_ids.size()));
     int num_sequence = seq_ids.size();
 
     CHECK(ft_.decode_func_.defined())
@@ -395,7 +391,8 @@ class ModelImpl : public ModelObj {
 
   ObjectRef BatchDecodeToLastHidden(const ObjectRef& hidden_states_dref_or_nd,
                                     const std::vector<int64_t>& seq_ids) final {
-    NVTXScopedRange nvtx_scope("BatchDecodeToLastHidden");
+    NVTXScopedRange nvtx_scope("BatchDecodeToLastHidden num_seqs=" +
+                               std::to_string(seq_ids.size()));
     int num_sequence = seq_ids.size();
 
     CHECK(ft_.decode_to_last_hidden_func_.defined())
@@ -443,7 +440,6 @@ class ModelImpl : public ModelObj {
 
   NDArray BatchVerify(const ObjectRef& embeddings, const std::vector<int64_t>& seq_ids,
                       const std::vector<int>& lengths) final {
-    NVTXScopedRange nvtx_scope("BatchVerify");
     CHECK(!seq_ids.empty());
     CHECK_EQ(seq_ids.size(), lengths.size());
     int num_sequences = seq_ids.size();
@@ -451,6 +447,8 @@ class ModelImpl : public ModelObj {
     for (int i = 0; i < num_sequences; ++i) {
       total_length += lengths[i];
     }
+
+    NVTXScopedRange nvtx_scope("BatchVerify num_tokens=" + std::to_string(total_length));
 
     CHECK(ft_.verify_func_.defined())
         << "`verify_with_embed` function is not found in the model. Please make sure the model is "
@@ -504,7 +502,6 @@ class ModelImpl : public ModelObj {
   ObjectRef BatchVerifyToLastHidden(const ObjectRef& embeddings,
                                     const std::vector<int64_t>& seq_ids,
                                     const std::vector<int>& lengths) final {
-    NVTXScopedRange nvtx_scope("BatchVerifyToLastHidden");
     CHECK(!seq_ids.empty());
     CHECK_EQ(seq_ids.size(), lengths.size());
     int num_sequences = seq_ids.size();
@@ -512,6 +509,8 @@ class ModelImpl : public ModelObj {
     for (int i = 0; i < num_sequences; ++i) {
       total_length += lengths[i];
     }
+    NVTXScopedRange nvtx_scope("BatchVerifyToLastHidden num_tokens=" +
+                               std::to_string(total_length));
 
     CHECK(ft_.verify_to_last_hidden_func_.defined())
         << "`batch_verify_to_last_hidden_states` function is not found in the model.";

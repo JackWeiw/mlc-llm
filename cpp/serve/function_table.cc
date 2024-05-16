@@ -232,7 +232,6 @@ void FunctionTable::_InitFunctions() {
     } else {
       this->create_kv_cache_func_ = mod_get_func("create_tir_paged_kv_cache");
     }
-    ICHECK(this->create_kv_cache_func_.defined());
   }
   this->reset_kv_cache_func_ = get_global_func("vm.builtin.kv_state_clear");
   this->kv_cache_add_sequence_func_ = get_global_func("vm.builtin.kv_state_add_sequence");
@@ -271,7 +270,7 @@ ObjectRef FunctionTable::Empty(ShapeTuple shape, DataType dtype, Device device) 
   Device null_device{DLDeviceType(0), 0};
   if (this->use_disco) {
     DRef empty_func = sess->GetGlobalFunc("runtime.disco.empty");
-    return sess->CallPacked(empty_func, shape, dtype, null_device);
+    return sess->CallPacked(empty_func, shape, dtype, null_device, false);
   } else {
     return NDArray::Empty(shape, dtype, device);
   }

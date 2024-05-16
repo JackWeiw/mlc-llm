@@ -31,7 +31,7 @@ void JSONFFIEngine::StreamBackError(std::string request_id) {
   ChatCompletionMessage delta;
   delta.content = std::vector<std::unordered_map<std::string, std::string>>{
       {{"type", "text"}, {"text", this->err_}}};
-  delta.role = Role::assistant;
+  delta.role = "assistant";
 
   ChatCompletionStreamResponseChoice choice;
   choice.finish_reason = FinishReason::error;
@@ -44,7 +44,9 @@ void JSONFFIEngine::StreamBackError(std::string request_id) {
   response.model = "json_ffi";  // TODO: Return model name from engine (or from args)
   response.system_fingerprint = "";
 
-  this->request_stream_callback_(Array<String>{picojson::value(response.AsJSON()).serialize()});
+  picojson::array response_arr;
+  response_arr.push_back(picojson::value(response.AsJSON()));
+  this->request_stream_callback_(picojson::value(response_arr).serialize());
 }
 
 bool JSONFFIEngine::AddRequest(std::string request_json_str, std::string request_id) {
@@ -54,38 +56,9 @@ bool JSONFFIEngine::AddRequest(std::string request_json_str, std::string request
     return false;
   }
   ChatCompletionRequest request = request_res.Unwrap();
-  // Create Request
-  // TODO: Check if request_id is present already
-
-  // inputs
-  Conversation conv_template = this->conv_template_;
-  std::vector<Message> messages;
-  for (const auto& message : request.messages) {
-    std::string role;
-    if (message.role == Role::user) {
-      role = "user";
-    } else if (message.role == Role::assistant) {
-      role = "assistant";
-    } else if (message.role == Role::tool) {
-      role = "tool";
-    } else {
-      role = "system";
-    }
-    messages.push_back({role, message.content});
-  }
-  messages.push_back({"assistant", std::nullopt});
-  conv_template.messages = messages;
-
-  // check function calling
-  Result<Conversation> updated_conv_template = request.CheckFunctionCalling(conv_template);
-  if (updated_conv_template.IsErr()) {
-    err_ = updated_conv_template.UnwrapErr();
-    return false;
-  }
-  conv_template = updated_conv_template.Unwrap();
-
-  // get prompt
-  Result<std::vector<Data>> inputs_obj = conv_template.AsPrompt(this->model_config_, this->device_);
+  // get prompt: note, assistant was appended in the end.
+  Result<std::vector<Data>> inputs_obj =
+      CreatePrompt(this->conv_template_, request, this->model_config_, this->device_);
   if (inputs_obj.IsErr()) {
     err_ = inputs_obj.UnwrapErr();
     return false;
@@ -94,8 +67,8 @@ bool JSONFFIEngine::AddRequest(std::string request_json_str, std::string request
 
   // generation_cfg
   Array<String> stop_strs;
-  stop_strs.reserve(conv_template.stop_str.size());
-  for (const std::string& stop_str : conv_template.stop_str) {
+  stop_strs.reserve(this->conv_template_.stop_str.size());
+  for (const std::string& stop_str : this->conv_template_.stop_str) {
     stop_strs.push_back(stop_str);
   }
   if (request.stop.has_value()) {
@@ -110,7 +83,7 @@ bool JSONFFIEngine::AddRequest(std::string request_json_str, std::string request
                                   /*repetition_penalty=*/std::nullopt, request.logprobs,
                                   request.top_logprobs, request.logit_bias, request.seed,
                                   request.ignore_eos, request.max_tokens, std::move(stop_strs),
-                                  conv_template.stop_token_ids, /*response_format=*/std::nullopt,
+                                  conv_template_.stop_token_ids, /*response_format=*/std::nullopt,
                                   this->default_generation_cfg_json_str_);
 
   Request engine_request(request_id, inputs, generation_cfg);
@@ -146,8 +119,9 @@ class JSONFFIEngineImpl : public JSONFFIEngine, public ModuleNode {
   TVM_MODULE_VTABLE_ENTRY("exit_background_loop", &JSONFFIEngineImpl::ExitBackgroundLoop);
   TVM_MODULE_VTABLE_END();
 
-  void InitBackgroundEngine(Device device, Optional<PackedFunc> request_stream_callback,
-                            Optional<EventTraceRecorder> trace_recorder) {
+  void InitBackgroundEngine(int device_type, int device_id,
+                            Optional<PackedFunc> request_stream_callback) {
+    DLDevice device{static_cast<DLDeviceType>(device_type), device_id};
     this->device_ = device;
     CHECK(request_stream_callback.defined())
         << "JSONFFIEngine requires request stream callback function, but it is not given.";
@@ -156,13 +130,12 @@ class JSONFFIEngineImpl : public JSONFFIEngine, public ModuleNode {
     auto frequest_stream_callback_wrapper = [this](TVMArgs args, TVMRetValue* ret) {
       ICHECK_EQ(args.size(), 1);
       Array<RequestStreamOutput> delta_outputs = args[0];
-      Array<String> responses = this->GetResponseFromStreamOutput(delta_outputs);
+      String responses = this->GetResponseFromStreamOutput(delta_outputs);
       this->request_stream_callback_(responses);
     };
 
     request_stream_callback = PackedFunc(frequest_stream_callback_wrapper);
-    this->engine_->InitThreadedEngine(device, std::move(request_stream_callback),
-                                      std::move(trace_recorder));
+    this->engine_->InitThreadedEngine(device, std::move(request_stream_callback), NullOpt);
   }
 
   void Reload(String engine_config_json_str) {
@@ -198,7 +171,7 @@ class JSONFFIEngineImpl : public JSONFFIEngine, public ModuleNode {
 
   void RunBackgroundStreamBackLoop() { this->engine_->RunBackgroundStreamBackLoop(); }
 
-  Array<String> GetResponseFromStreamOutput(Array<RequestStreamOutput> delta_outputs) {
+  String GetResponseFromStreamOutput(Array<RequestStreamOutput> delta_outputs) {
     std::unordered_map<std::string, std::vector<ChatCompletionStreamResponseChoice>> response_map;
     for (const auto& delta_output : delta_outputs) {
       std::string request_id = delta_output->request_id;
@@ -232,27 +205,24 @@ class JSONFFIEngineImpl : public JSONFFIEngine, public ModuleNode {
       // Size of delta_output->group_delta_token_ids Array should be 1
       IntTuple delta_token_ids = delta_output->group_delta_token_ids[0];
       std::vector<int32_t> delta_token_ids_vec(delta_token_ids.begin(), delta_token_ids.end());
-      delta.content = std::vector<std::unordered_map<std::string, std::string>>();
-      delta.content.value().push_back(std::unordered_map<std::string, std::string>{
-          {"type", "text"}, {"text", this->streamer_->Put(delta_token_ids_vec)}});
-
-      delta.role = Role::assistant;
+      delta.content = this->streamer_->Put(delta_token_ids_vec);
+      delta.role = "assistant";
 
       choice.delta = delta;
 
       response_map[request_id].push_back(choice);
     }
 
-    Array<String> response_arr;
+    picojson::array response_arr;
     for (const auto& [request_id, choices] : response_map) {
       ChatCompletionStreamResponse response;
       response.id = request_id;
       response.choices = choices;
       response.model = "json_ffi";  // TODO: Return model name from engine (or from args)
       response.system_fingerprint = "";
-      response_arr.push_back(picojson::value(response.AsJSON()).serialize());
+      response_arr.push_back(picojson::value(response.AsJSON()));
     }
-    return response_arr;
+    return picojson::value(response_arr).serialize();
   }
 };
 

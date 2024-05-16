@@ -10,6 +10,7 @@
 #include "../sampler/sampler.h"
 #include "action.h"
 #include "action_commons.h"
+#include "batch_prefill_base.h"
 
 namespace mlc {
 namespace llm {
@@ -19,7 +20,7 @@ namespace serve {
  * \brief The action that prefills requests in the `waiting_queue` of
  * the engine state.
  */
-class EagleNewRequestPrefillActionObj : public EngineActionObj {
+class EagleNewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
  public:
   explicit EagleNewRequestPrefillActionObj(Array<Model> models, LogitProcessor logit_processor,
                                            Sampler sampler,
@@ -27,13 +28,12 @@ class EagleNewRequestPrefillActionObj : public EngineActionObj {
                                            DraftTokenWorkspaceManager draft_token_workspace_manager,
                                            EngineConfig engine_config,
                                            Optional<EventTraceRecorder> trace_recorder)
-      : models_(std::move(models)),
+      : BatchPrefillBaseActionObj(std::move(models), std::move(engine_config),
+                                  std::move(trace_recorder)),
         logit_processor_(std::move(logit_processor)),
         sampler_(std::move(sampler)),
         model_workspaces_(std::move(model_workspaces)),
-        draft_token_workspace_manager_(std::move(draft_token_workspace_manager)),
-        engine_config_(std::move(engine_config)),
-        trace_recorder_(std::move(trace_recorder)) {}
+        draft_token_workspace_manager_(std::move(draft_token_workspace_manager)) {}
 
   Array<Request> Step(EngineState estate) final {
     // - Find the requests in `waiting_queue` that can prefill in this step.
@@ -53,32 +53,8 @@ class EagleNewRequestPrefillActionObj : public EngineActionObj {
     Array<String> request_ids;
     std::vector<RequestState> rstates_of_entries;
     std::vector<RequestStateStatus> status_before_prefill;
-    request_ids.reserve(num_rsentries);
-    rstates_of_entries.reserve(num_rsentries);
-    status_before_prefill.reserve(num_rsentries);
-    for (const PrefillInput& prefill_input : prefill_inputs) {
-      const RequestStateEntry& rsentry = prefill_input.rsentry;
-      const Request& request = rsentry->request;
-      RequestState request_rstate = estate->GetRequestState(request);
-      request_ids.push_back(request->id);
-      status_before_prefill.push_back(rsentry->status);
-      rsentry->status = RequestStateStatus::kAlive;
-
-      if (status_before_prefill.back() == RequestStateStatus::kPending) {
-        // - Add the request to running queue if the request state
-        // status was pending and all its request states were pending.
-        bool alive_state_existed = false;
-        for (const RequestStateEntry& rsentry_ : request_rstate->entries) {
-          if (rsentry_->status == RequestStateStatus::kAlive && !rsentry_.same_as(rsentry)) {
-            alive_state_existed = true;
-          }
-        }
-        if (!alive_state_existed) {
-          estate->running_queue.push_back(request);
-        }
-      }
-      rstates_of_entries.push_back(std::move(request_rstate));
-    }
+    UpdateRequestToAlive(prefill_inputs, estate, &request_ids, &rstates_of_entries,
+                         &status_before_prefill);
 
     // - Get embedding and run prefill for each model.
     std::vector<int> prefill_lengths;
@@ -135,6 +111,11 @@ class EagleNewRequestPrefillActionObj : public EngineActionObj {
           }
         }
         request_internal_ids.push_back(mstate->internal_id);
+
+        if (engine_config_->speculative_mode == SpeculativeMode::kMedusa && model_id > 0) {
+          // Embedding is only needed for the base model in Medusa.
+          continue;
+        }
         RECORD_EVENT(trace_recorder_, prefill_inputs[i].rsentry->request->id, "start embedding");
         // Speculative models shift left the input tokens by 1 when base model has committed tokens.
         // Note: for n > 1 cases Eagle doesn't work because parent entry doesn't shift input tokens.
@@ -149,59 +130,56 @@ class EagleNewRequestPrefillActionObj : public EngineActionObj {
       }
 
       RECORD_EVENT(trace_recorder_, request_ids, "start prefill");
-      ObjectRef embedding_or_hidden_states{nullptr};
-      if (model_id == 0) {
-        embedding_or_hidden_states = embeddings;
-      } else {
-        embedding_or_hidden_states = models_[model_id]->FuseEmbedHidden(
-            embeddings, hidden_states_for_input, /*batch_size*/ 1, /*seq_len*/ cum_prefill_length);
-      }
-      // hidden_states: (b * s, h)
-      ObjectRef hidden_states = models_[model_id]->BatchPrefillToLastHidden(
-          embedding_or_hidden_states, request_internal_ids, prefill_lengths);
-      RECORD_EVENT(trace_recorder_, request_ids, "finish prefill");
 
-      if (model_id == 0) {
-        // We only need to sample for model 0 in prefill.
-        hidden_states_for_input = hidden_states;
-      }
+      Array<NDArray> multi_step_logits{nullptr};
 
-      // Whether to use base model to get logits.
-      int sample_model_id = !models_[model_id]->CanGetLogits() ? 0 : model_id;
-
-      std::vector<int> logit_positions;
-      {
-        // Prepare the logit positions
-        logit_positions.reserve(prefill_lengths.size());
-        int total_len = 0;
-        for (int i = 0; i < prefill_lengths.size(); ++i) {
-          total_len += prefill_lengths[i];
-          logit_positions.push_back(total_len - 1);
+      if (model_id == 0 || engine_config_->speculative_mode == SpeculativeMode::kEagle) {
+        ObjectRef embedding_or_hidden_states{nullptr};
+        if (model_id == 0) {
+          embedding_or_hidden_states = embeddings;
+        } else {
+          embedding_or_hidden_states =
+              models_[model_id]->FuseEmbedHidden(embeddings, hidden_states_for_input,
+                                                 /*batch_size*/ 1, /*seq_len*/ cum_prefill_length);
         }
-      }
-      // hidden_states_for_sample: (b * s, h)
-      hidden_states_for_sample = models_[sample_model_id]->GatherHiddenStates(
-          hidden_states, logit_positions, &model_workspaces_[model_id].hidden_states);
-      // logits_for_sample: (b * s, v)
-      logits_for_sample = models_[sample_model_id]->GetLogits(hidden_states_for_sample);
-      // - Update logits.
-      ICHECK(logits_for_sample.defined());
-      Array<GenerationConfig> generation_cfg;
-      Array<RequestModelState> mstates_for_logitproc;
-      generation_cfg.reserve(num_rsentries);
-      mstates_for_logitproc.reserve(num_rsentries);
-      for (int i = 0; i < num_rsentries; ++i) {
-        generation_cfg.push_back(prefill_inputs[i].rsentry->request->generation_cfg);
-        mstates_for_logitproc.push_back(prefill_inputs[i].rsentry->mstates[sample_model_id]);
-      }
-      logit_processor_->InplaceUpdateLogits(logits_for_sample, generation_cfg,
-                                            mstates_for_logitproc, request_ids);
+        // hidden_states: (b * s, h)
+        ObjectRef hidden_states = models_[model_id]->BatchPrefillToLastHidden(
+            embedding_or_hidden_states, request_internal_ids, prefill_lengths);
+        RECORD_EVENT(trace_recorder_, request_ids, "finish prefill");
 
-      // - Compute probability distributions.
-      NDArray probs_on_device =
-          logit_processor_->ComputeProbsFromLogits(logits_for_sample, generation_cfg, request_ids);
+        if (model_id == 0) {
+          // We only need to sample for model 0 in prefill.
+          hidden_states_for_input = hidden_states;
+        }
 
-      // - Sample tokens.
+        // Whether to use base model to get logits.
+        int sample_model_id = !models_[model_id]->CanGetLogits() ? 0 : model_id;
+
+        std::vector<int> logit_positions;
+        {
+          // Prepare the logit positions
+          logit_positions.reserve(prefill_lengths.size());
+          int total_len = 0;
+          for (int i = 0; i < prefill_lengths.size(); ++i) {
+            total_len += prefill_lengths[i];
+            logit_positions.push_back(total_len - 1);
+          }
+        }
+        // hidden_states_for_sample: (b * s, h)
+        hidden_states_for_sample = models_[sample_model_id]->GatherHiddenStates(
+            hidden_states, logit_positions, &model_workspaces_[model_id].hidden_states);
+        // logits_for_sample: (b * s, v)
+        logits_for_sample = models_[sample_model_id]->GetLogits(hidden_states_for_sample);
+      } else if (engine_config_->speculative_mode == SpeculativeMode::kMedusa) {
+        // Note: spec_draft_length in engine config has to be match the model config in Medusa.
+        multi_step_logits = models_[model_id]->GetMultiStepLogits(hidden_states_for_sample);
+      } else {
+        LOG(FATAL) << "unreachable";
+      }
+
+      Array<String> request_ids_for_logitproc = request_ids;
+
+      // - Prepare the configurations for the sampler.
       //   For prefill_inputs which have children, sample
       //   one token for each rstate that is depending.
       //   Otherwise, sample a token for the current rstate.
@@ -209,12 +187,12 @@ class EagleNewRequestPrefillActionObj : public EngineActionObj {
       std::vector<RequestStateEntry> rsentries_for_sample;
       std::vector<RandomGenerator*> rngs;
       std::vector<bool> rsentry_activated;
+      Array<GenerationConfig> generation_cfg;
       sample_indices.reserve(num_rsentries);
       rsentries_for_sample.reserve(num_rsentries);
       rngs.reserve(num_rsentries);
       rsentry_activated.reserve(num_rsentries);
       request_ids.clear();
-      generation_cfg.clear();
       for (int i = 0; i < num_rsentries; ++i) {
         const RequestStateEntry& rsentry = prefill_inputs[i].rsentry;
         // No sample for rsentries with remaining inputs.
@@ -275,27 +253,26 @@ class EagleNewRequestPrefillActionObj : public EngineActionObj {
         }
       }
 
-      NDArray renormalized_probs = sampler_->BatchRenormalizeProbsByTopP(
-          probs_on_device, sample_indices, request_ids, generation_cfg);
-      std::vector<SampleResult> sample_results = sampler_->BatchSampleTokensWithProbAfterTopP(
-          renormalized_probs, sample_indices, request_ids, generation_cfg, rngs);
-      ICHECK_EQ(sample_results.size(), rsentries_for_sample.size());
-
-      // - Update the committed tokens of states.
-      // - If a request is first-time prefilled, set the prefill finish time.
-      auto tnow = std::chrono::high_resolution_clock::now();
-      if (model_id == 0) {
-        for (int i = 0; i < static_cast<int>(rsentries_for_sample.size()); ++i) {
-          for (int mid = 0; mid < static_cast<int>(models_.size()); ++mid) {
-            rsentries_for_sample[i]->mstates[mid]->CommitToken(sample_results[i]);
-            if (!rsentry_activated[i]) {
-              // When the child rsentry is not activated,
-              // add the sampled token as an input of the mstate for prefill.
-              rsentries_for_sample[i]->mstates[mid]->inputs.push_back(
-                  TokenData(std::vector<int64_t>{sample_results[i].sampled_token_id.first}));
-            }
-            if (mid > 0) {
-              // Add the sampled token as an input of the eagle models.
+      // - Prepare input for logit processor.
+      ICHECK(logits_for_sample.defined());
+      Array<GenerationConfig> generation_cfg_for_logitproc;
+      Array<RequestModelState> mstates_for_logitproc;
+      generation_cfg_for_logitproc.reserve(num_rsentries);
+      mstates_for_logitproc.reserve(num_rsentries);
+      for (int i = 0; i < num_rsentries; ++i) {
+        generation_cfg_for_logitproc.push_back(prefill_inputs[i].rsentry->request->generation_cfg);
+        mstates_for_logitproc.push_back(prefill_inputs[i].rsentry->mstates[model_id]);
+      }
+      if (model_id == 0 || engine_config_->speculative_mode == SpeculativeMode::kEagle) {
+        const auto& [renormalized_probs, sample_results] = ApplyLogitProcessorAndSample(
+            logit_processor_, sampler_, logits_for_sample, generation_cfg_for_logitproc,
+            request_ids_for_logitproc, mstates_for_logitproc, rngs, sample_indices);
+        if (model_id == 0) {
+          UpdateRequestStateEntriesWithSampleResults(rsentries_for_sample, rsentry_activated,
+                                                     sample_results);
+          // Add the sampled token as an input of the eagle models.
+          for (int i = 0; i < static_cast<int>(rsentries_for_sample.size()); ++i) {
+            for (int mid = 1; mid < static_cast<int>(models_.size()); ++mid) {
               TokenData token_data =
                   Downcast<TokenData>(rsentries_for_sample[i]->mstates[mid]->inputs.back());
               std::vector<int32_t> token_ids = {token_data->token_ids.begin(),
@@ -306,25 +283,21 @@ class EagleNewRequestPrefillActionObj : public EngineActionObj {
                   ninputs - 1, TokenData(IntTuple(token_ids.begin(), token_ids.end())));
             }
           }
-          // Only base model trigger timing records.
-          if (rsentries_for_sample[i]->mstates[0]->committed_tokens.size() == 1) {
-            rsentries_for_sample[i]->tprefill_finish = tnow;
-          }
+        } else {
+          // - Slice and save hidden_states_for_sample
+          UpdateRequestStatesWithDraftProposals(rsentries_for_sample, sample_results, model_id,
+                                                renormalized_probs, hidden_states_for_sample,
+                                                estate);
         }
-      } else {
-        // - Slice and save hidden_states_for_sample
-        draft_token_workspace_manager_->AllocSlots(rsentries_for_sample.size(),
-                                                   &draft_token_slots_);
-        models_[model_id]->ScatterDraftProbs(renormalized_probs, draft_token_slots_,
-                                             &model_workspaces_[0].draft_probs_storage);
-        if (engine_config_->spec_draft_length > 1) {
-          models_[model_id]->ScatterHiddenStates(hidden_states_for_sample, draft_token_slots_,
-                                                 &model_workspaces_[0].draft_hidden_states_storage);
-        }
-        for (int i = 0; i < static_cast<int>(rsentries_for_sample.size()); ++i) {
-          rsentries_for_sample[i]->mstates[model_id]->AddDraftToken(sample_results[i],
-                                                                    draft_token_slots_[i]);
-          estate->stats.total_draft_length += 1;
+      } else if (engine_config_->speculative_mode == SpeculativeMode::kMedusa) {
+        for (int draft_id = 0; draft_id < engine_config_->spec_draft_length; ++draft_id) {
+          const auto& [renormalized_probs, sample_results] = ApplyLogitProcessorAndSample(
+              logit_processor_, sampler_, multi_step_logits[draft_id], generation_cfg_for_logitproc,
+              request_ids_for_logitproc, mstates_for_logitproc, rngs, sample_indices);
+
+          UpdateRequestStatesWithDraftProposals(rsentries_for_sample, sample_results, model_id,
+                                                renormalized_probs,
+                                                /*hidden_states=*/ObjectRef{nullptr}, estate);
         }
       }
     }
@@ -332,246 +305,32 @@ class EagleNewRequestPrefillActionObj : public EngineActionObj {
     auto tend = std::chrono::high_resolution_clock::now();
     estate->stats.engine_total_prefill_time += static_cast<double>((tend - tstart).count()) / 1e9;
 
-    // - Remove the request from waiting queue if all its request states
-    // are now alive and have no remaining chunked inputs.
-    std::vector<Request> processed_requests;
-    {
-      processed_requests.reserve(num_rsentries);
-      std::unordered_set<const RequestNode*> dedup_map;
-      for (int i = 0; i < num_rsentries; ++i) {
-        const RequestStateEntry& rsentry = prefill_inputs[i].rsentry;
-        if (dedup_map.find(rsentry->request.get()) != dedup_map.end()) {
-          continue;
-        }
-        dedup_map.insert(rsentry->request.get());
-        processed_requests.push_back(rsentry->request);
-
-        bool pending_state_exists = false;
-        for (const RequestStateEntry& rsentry_ : rstates_of_entries[i]->entries) {
-          if (rsentry_->status == RequestStateStatus::kPending ||
-              !rsentry_->mstates[0]->inputs.empty()) {
-            pending_state_exists = true;
-            break;
-          }
-        }
-        if (!pending_state_exists) {
-          auto it = std::find(estate->waiting_queue.begin(), estate->waiting_queue.end(),
-                              rsentry->request);
-          ICHECK(it != estate->waiting_queue.end());
-          estate->waiting_queue.erase(it);
-        }
-      }
-    }
+    std::vector<Request> processed_requests =
+        RemoveProcessedRequests(prefill_inputs, estate, rstates_of_entries);
     return processed_requests;
   }
 
+  void UpdateRequestStatesWithDraftProposals(
+      const std::vector<RequestStateEntry>& rsentries_for_sample,
+      const std::vector<SampleResult>& sample_results, int model_id,
+      const NDArray& renormalized_probs, const ObjectRef& hidden_states_for_sample,
+      EngineState estate) {
+    draft_token_workspace_manager_->AllocSlots(rsentries_for_sample.size(), &draft_token_slots_);
+    models_[0]->ScatterDraftProbs(renormalized_probs, draft_token_slots_,
+                                  &model_workspaces_[0].draft_probs_storage);
+    if (engine_config_->speculative_mode == SpeculativeMode::kEagle &&
+        engine_config_->spec_draft_length > 1) {
+      models_[0]->ScatterHiddenStates(hidden_states_for_sample, draft_token_slots_,
+                                      &model_workspaces_[0].draft_hidden_states_storage);
+    }
+    for (int i = 0; i < static_cast<int>(rsentries_for_sample.size()); ++i) {
+      rsentries_for_sample[i]->mstates[model_id]->AddDraftToken(sample_results[i],
+                                                                draft_token_slots_[i]);
+      estate->stats.total_draft_length += 1;
+    }
+  }
+
  private:
-  /*! \brief The class of request state entry and its maximum allowed length for prefill. */
-  struct PrefillInput {
-    RequestStateEntry rsentry;
-    int max_prefill_length = 0;
-    int num_child_to_activate = 0;
-  };
-
-  /*!
-   * \brief Find one or multiple request state entries to run prefill.
-   * \param estate The engine state.
-   * \return The request entries to prefill, together with their input lengths.
-   */
-  std::vector<PrefillInput> GetRequestStateEntriesToPrefill(EngineState estate) {
-    if (estate->waiting_queue.empty()) {
-      // No request to prefill.
-      return {};
-    }
-
-    std::vector<PrefillInput> prefill_inputs;
-
-    // - Try to prefill pending requests.
-    int total_input_length = 0;
-    int total_required_pages = 0;
-    int num_available_pages = models_[0]->GetNumAvailablePages();
-    int num_running_rsentries = GetRunningRequestStateEntries(estate).size();
-    int current_total_seq_len = models_[0]->GetCurrentTotalSequenceLength();
-
-    int num_prefill_rsentries = 0;
-    for (const Request& request : estate->waiting_queue) {
-      RequestState rstate = estate->GetRequestState(request);
-      bool prefill_stops = false;
-      for (const RequestStateEntry& rsentry : rstate->entries) {
-        // A request state entry can be prefilled only when:
-        // - it has inputs, and
-        // - it has no parent or its parent is alive and has no remaining input.
-        if (rsentry->mstates[0]->inputs.empty() ||
-            (rsentry->parent_idx != -1 &&
-             (rstate->entries[rsentry->parent_idx]->status == RequestStateStatus::kPending ||
-              !rstate->entries[rsentry->parent_idx]->mstates[0]->inputs.empty()))) {
-          continue;
-        }
-
-        int input_length = rsentry->mstates[0]->GetInputLength();
-        int num_require_pages = (input_length + engine_config_->kv_cache_page_size - 1) /
-                                engine_config_->kv_cache_page_size;
-        total_input_length += input_length;
-        total_required_pages += num_require_pages;
-        // - Attempt 1. Check if the entire request state entry can fit for prefill.
-        bool can_prefill = false;
-        for (int num_child_to_activate = rsentry->child_indices.size(); num_child_to_activate >= 0;
-             --num_child_to_activate) {
-          if (CanPrefill(estate, num_prefill_rsentries + 1 + num_child_to_activate,
-                         total_input_length, total_required_pages, num_available_pages,
-                         current_total_seq_len, num_running_rsentries)) {
-            prefill_inputs.push_back({rsentry, input_length, num_child_to_activate});
-            num_prefill_rsentries += 1 + num_child_to_activate;
-            can_prefill = true;
-            break;
-          }
-        }
-        if (can_prefill) {
-          continue;
-        }
-        total_input_length -= input_length;
-        total_required_pages -= num_require_pages;
-
-        // - Attempt 2. Check if the request state entry can partially fit by input chunking.
-        ICHECK_LE(total_input_length, engine_config_->prefill_chunk_size);
-        if (engine_config_->prefill_chunk_size - total_input_length >= input_length ||
-            engine_config_->prefill_chunk_size == total_input_length) {
-          // 1. If the input length can fit the remaining prefill chunk size,
-          // it means the failure of attempt 1 is not because of the input
-          // length being too long, and thus chunking does not help.
-          // 2. If the total input length already reaches the prefill chunk size,
-          // the current request state entry will not be able to be processed.
-          // So we can safely return in either case.
-          prefill_stops = true;
-          break;
-        }
-        input_length = engine_config_->prefill_chunk_size - total_input_length;
-        num_require_pages = (input_length + engine_config_->kv_cache_page_size - 1) /
-                            engine_config_->kv_cache_page_size;
-        total_input_length += input_length;
-        total_required_pages += num_require_pages;
-        if (CanPrefill(estate, num_prefill_rsentries + 1, total_input_length, total_required_pages,
-                       num_available_pages, current_total_seq_len, num_running_rsentries)) {
-          prefill_inputs.push_back({rsentry, input_length, 0});
-          num_prefill_rsentries += 1;
-        }
-
-        // - Prefill stops here.
-        prefill_stops = true;
-        break;
-      }
-      if (prefill_stops) {
-        break;
-      }
-    }
-
-    return prefill_inputs;
-  }
-
-  /*! \brief Check if the input requests can be prefilled under conditions. */
-  bool CanPrefill(EngineState estate, int num_prefill_rsentries, int total_input_length,
-                  int num_required_pages, int num_available_pages, int current_total_seq_len,
-                  int num_running_rsentries) {
-    ICHECK_LE(num_running_rsentries, engine_config_->max_num_sequence);
-
-    // No exceeding of the maximum allowed requests that can
-    // run simultaneously.
-    int spec_factor = engine_config_->speculative_mode != SpeculativeMode::kDisable
-                          ? (engine_config_->spec_draft_length + 1)
-                          : 1;
-    if ((num_running_rsentries + num_prefill_rsentries) * spec_factor >
-        std::min(engine_config_->max_num_sequence, engine_config_->prefill_chunk_size)) {
-      return false;
-    }
-
-    // NOTE: The conditions are heuristic and can be revised.
-    // Cond 1: total input length <= prefill chunk size.
-    // Cond 2: at least one decode can be performed after prefill.
-    // Cond 3: number of total tokens after 8 times of decode does not
-    // exceed the limit, where 8 is a watermark number can
-    // be configured and adjusted in the future.
-    int new_batch_size = num_running_rsentries + num_prefill_rsentries;
-    return total_input_length <= engine_config_->prefill_chunk_size &&
-           num_required_pages + new_batch_size <= num_available_pages &&
-           current_total_seq_len + total_input_length + 8 * new_batch_size <=
-               engine_config_->max_total_sequence_length;
-  }
-
-  /*!
-   * \brief Chunk the input of the given RequestModelState for prefill
-   * with regard to the provided maximum allowed prefill length.
-   * Return the list of input for prefill and the total prefill length.
-   * The `inputs` field of the given `mstate` will be mutated to exclude
-   * the returned input.
-   * \param mstate The RequestModelState whose input data is to be chunked.
-   * \param max_prefill_length The maximum allowed prefill length for the mstate.
-   * \return The list of input for prefill and the total prefill length.
-   */
-  std::pair<Array<Data>, int> ChunkPrefillInputData(const RequestModelState& mstate,
-                                                    int max_prefill_length) {
-    if (mstate->inputs.empty()) {
-    }
-    ICHECK(!mstate->inputs.empty());
-    std::vector<Data> inputs;
-    int cum_input_length = 0;
-    inputs.reserve(mstate->inputs.size());
-    for (int i = 0; i < static_cast<int>(mstate->inputs.size()); ++i) {
-      inputs.push_back(mstate->inputs[i]);
-      int input_length = mstate->inputs[i]->GetLength();
-      cum_input_length += input_length;
-      // Case 0. the cumulative input length does not reach the maximum prefill length.
-      if (cum_input_length < max_prefill_length) {
-        continue;
-      }
-
-      // Case 1. the cumulative input length equals the maximum prefill length.
-      if (cum_input_length == max_prefill_length) {
-        if (i == static_cast<int>(mstate->inputs.size()) - 1) {
-          // - If `i` is the last input, we just copy and reset `mstate->inputs`.
-          mstate->inputs.clear();
-        } else {
-          // - Otherwise, set the new input array.
-          mstate->inputs = Array<Data>{mstate->inputs.begin() + i + 1, mstate->inputs.end()};
-        }
-        return {inputs, cum_input_length};
-      }
-
-      // Case 2. cum_input_length > max_prefill_length
-      // The input `i` itself needs chunking if it is TokenData,
-      // or otherwise it cannot be chunked.
-      Data input = mstate->inputs[i];
-      inputs.pop_back();
-      cum_input_length -= input_length;
-      const auto* token_input = input.as<TokenDataNode>();
-      if (token_input == nullptr) {
-        // Cannot chunk the input.
-        if (i != 0) {
-          mstate->inputs = Array<Data>{mstate->inputs.begin() + i, mstate->inputs.end()};
-        }
-        return {inputs, cum_input_length};
-      }
-
-      // Split the token data into two parts.
-      // Return the first part for prefill, and keep the second part.
-      int chunked_input_length = max_prefill_length - cum_input_length;
-      ICHECK_GT(input_length, chunked_input_length);
-      TokenData chunked_input(IntTuple{token_input->token_ids.begin(),
-                                       token_input->token_ids.begin() + chunked_input_length});
-      TokenData remaining_input(IntTuple{token_input->token_ids.begin() + chunked_input_length,
-                                         token_input->token_ids.end()});
-      inputs.push_back(chunked_input);
-      cum_input_length += chunked_input_length;
-      std::vector<Data> remaining_inputs{mstate->inputs.begin() + i + 1, mstate->inputs.end()};
-      remaining_inputs.insert(remaining_inputs.begin(), remaining_input);
-      mstate->inputs = remaining_inputs;
-      return {inputs, cum_input_length};
-    }
-
-    ICHECK(false) << "Cannot reach here";
-  }
-
-  /*! \brief The models to run prefill in. */
-  Array<Model> models_;
   /*! \brief The logit processor. */
   LogitProcessor logit_processor_;
   /*! \brief The sampler to sample new tokens. */
@@ -580,10 +339,6 @@ class EagleNewRequestPrefillActionObj : public EngineActionObj {
   std::vector<ModelWorkspace> model_workspaces_;
   /*! \brief The draft token workspace manager. */
   DraftTokenWorkspaceManager draft_token_workspace_manager_;
-  /*! \brief The engine config. */
-  EngineConfig engine_config_;
-  /*! \brief Event trace recorder. */
-  Optional<EventTraceRecorder> trace_recorder_;
   /*! \brief Temporary buffer to store the slots of the current draft tokens */
   std::vector<int> draft_token_slots_;
 };

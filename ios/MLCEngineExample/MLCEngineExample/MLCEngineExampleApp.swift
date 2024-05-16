@@ -38,29 +38,20 @@ class AppState: ObservableObject {
             // Step 0: load the engine
             await engine.reload(modelPath: modelLocalPath, modelLib: modelLib)
 
-            // TODO(mlc-team) update request so it is also structure based
-            // as in open ai api
-            // sent a request
-            let jsonRequest = """
-            {
-                "model": "llama3",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            { "type": "text", "text": "What is the meaning of life?" }
-                        ]
-                    }
-                ]
-            }
-            """
             // run chat completion as in OpenAI API style
-            for await res in await engine.chatCompletion(jsonRequest: jsonRequest) {
+            for await res in await engine.chatCompletion(
+                messages: [
+                    ChatCompletionMessage(
+                        role: .user,
+                        content: "What is the meaning of life?"
+                    )
+                ]
+            ) {
                 // publish at main event loop
                 DispatchQueue.main.async {
                     // parse the result content in structured form
                     // and stream back to the display
-                    self.displayText += res.choices[0].delta.content![0]["text"]!
+                    self.displayText += res.choices[0].delta.content!.asText()
                 }
             }
         }

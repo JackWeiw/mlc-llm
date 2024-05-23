@@ -4,6 +4,7 @@ from typing import Dict, List, Optional
 from pydantic import BaseModel
 
 from mlc_llm.json_ffi import JSONFFIEngine
+from mlc_llm.testing import require_test_model
 
 chat_completion_prompts = [
     "What is the meaning of life?",
@@ -59,7 +60,7 @@ def run_chat_completion(
 
     for rid in range(num_requests):
         print(f"chat completion for request {rid}")
-        for response in engine.chat_completion(
+        for response in engine.chat.completions.create(
             messages=[{"role": "user", "content": [{"type": "text", "text": prompts[rid]}]}],
             model=model,
             max_tokens=max_tokens,
@@ -106,7 +107,7 @@ def run_json_schema_function_calling(
 
     for rid in range(num_requests):
         print(f"chat completion for request {rid}")
-        for response in engine.chat_completion(
+        for response in engine.chat.completions.create(
             messages=[
                 {
                     "role": "system",
@@ -142,9 +143,9 @@ def run_json_schema_function_calling(
                 print(f"Output {req_id}({i}):{output}\n")
 
 
-def test_chat_completion():
+@require_test_model("Llama-2-7b-chat-hf-q4f16_1-MLC")
+def test_chat_completion(model):
     # Create engine.
-    model = "HF://mlc-ai/Llama-2-7b-chat-hf-q4f16_1-MLC"
     engine = JSONFFIEngine(
         model,
         max_total_sequence_length=1024,
@@ -153,16 +154,16 @@ def test_chat_completion():
     run_chat_completion(engine, model)
 
     # Test malformed requests.
-    for response in engine._handle_chat_completion("malformed_string", n=1, request_id="123"):
+    for response in engine._raw_chat_completion("malformed_string", n=1, request_id="123"):
         assert len(response.choices) == 1
         assert response.choices[0].finish_reason == "error"
 
     engine.terminate()
 
 
-def test_reload_reset_unload():
+@require_test_model("Llama-2-7b-chat-hf-q4f16_1-MLC")
+def test_reload_reset_unload(model):
     # Create engine.
-    model = "HF://mlc-ai/Llama-2-7b-chat-hf-q4f16_1-MLC"
     engine = JSONFFIEngine(
         model,
         max_total_sequence_length=1024,
@@ -179,8 +180,8 @@ def test_reload_reset_unload():
     engine.terminate()
 
 
-def test_json_schema_with_system_prompt():
-    model = "HF://mlc-ai/Hermes-2-Pro-Mistral-7B-q4f16_1-MLC"
+@require_test_model("Hermes-2-Pro-Mistral-7B-q4f16_1-MLC")
+def test_json_schema_with_system_prompt(model):
     engine = JSONFFIEngine(
         model,
         max_total_sequence_length=1024,

@@ -427,6 +427,8 @@ class MLCEngineBase:  # pylint: disable=too-many-instance-attributes,too-few-pub
         gpu_memory_utilization: Optional[float],
         speculative_mode: Literal["disable", "small_draft", "eagle", "medusa"],
         spec_draft_length: int,
+        prefix_cache_mode: Literal["disable", "radix"],
+        prefix_cache_max_num_recycling_seqs: Optional[int],
         enable_tracing: bool,
         verbose: bool,
     ) -> None:
@@ -479,16 +481,13 @@ class MLCEngineBase:  # pylint: disable=too-many-instance-attributes,too-few-pub
             self.state.trace_recorder,
         )
 
-        def _background_loop():
-            self._ffi["run_background_loop"]()
-
-        def _background_stream_back_loop():
-            self._ffi["run_background_stream_back_loop"]()
+        background_loop = self._ffi["run_background_loop"]
+        background_stream_back_loop = self._ffi["run_background_stream_back_loop"]
 
         # - Create the background engine-driving thread and start the loop.
-        self._background_loop_thread: threading.Thread = threading.Thread(target=_background_loop)
+        self._background_loop_thread: threading.Thread = threading.Thread(target=background_loop)
         self._background_stream_back_loop_thread: threading.Thread = threading.Thread(
-            target=_background_stream_back_loop
+            target=background_stream_back_loop
         )
         self._background_loop_thread.start()
         self._background_stream_back_loop_thread.start()
@@ -509,6 +508,8 @@ class MLCEngineBase:  # pylint: disable=too-many-instance-attributes,too-few-pub
                 max_history_size=max_history_size,
                 speculative_mode=speculative_mode,
                 spec_draft_length=spec_draft_length,
+                prefix_cache_mode=prefix_cache_mode,
+                prefix_cache_max_num_recycling_seqs=prefix_cache_max_num_recycling_seqs,
                 verbose=verbose,
             ).asjson()
         )
@@ -519,8 +520,14 @@ class MLCEngineBase:  # pylint: disable=too-many-instance-attributes,too-few-pub
             self.engine_config.max_total_sequence_length,
         )
 
+    def __del__(self):
+        """deleter, auto terminate"""
+        self.terminate()
+
     def terminate(self):
         """Terminate the engine."""
+        if self._terminated:
+            return
         self._terminated = True
         self._ffi["exit_background_loop"]()
         self._background_loop_thread.join()

@@ -12,6 +12,7 @@
 #include <tvm/runtime/registry.h>
 #include <tvm/runtime/threading_backend.h>
 
+#include <functional>
 #include <numeric>
 #include <optional>
 #include <tuple>
@@ -97,6 +98,23 @@ class EngineImpl : public Engine {
       return TResult::Error(engine_config_res.UnwrapErr());
     }
     EngineConfig engine_config = engine_config_res.Unwrap();
+    {
+      EngineState estate = n->estate_;
+      Array<Model> models = n->models_;
+      if (engine_config->prefix_cache_mode == PrefixCacheMode::kRadix) {
+        n->estate_->prefix_cache = PrefixCache::CreateRadixPrefixCache(
+            static_cast<size_t>(engine_config->prefix_cache_max_num_recycling_seqs),
+            std::function<void(int64_t)>([estate, models](int64_t seq_id) {
+              RemoveRequestFromModel(estate, seq_id, models);
+              estate->id_manager.RecycleId(seq_id);
+            }));
+      } else if (engine_config->prefix_cache_mode == PrefixCacheMode::kDisable) {
+        n->estate_->prefix_cache = PrefixCache::CreateNoPrefixCache();
+      } else {
+        LOG(FATAL) << "Unsupported prefix cache mode: "
+                   << static_cast<int>(engine_config->prefix_cache_mode);
+      }
+    }
     // - Load model weights, create KV cache and workspace.
     n->model_workspaces_.clear();
     for (const Model& model : n->models_) {
@@ -152,6 +170,7 @@ class EngineImpl : public Engine {
                                                    n->model_workspaces_,           //
                                                    draft_token_workspace_manager,  //
                                                    engine_config,                  //
+                                                   model_configs,                  //
                                                    n->trace_recorder_),
               EngineAction::EagleBatchDraft(n->models_, logit_processor, sampler,
                                             n->model_workspaces_, draft_token_workspace_manager,
@@ -167,6 +186,7 @@ class EngineImpl : public Engine {
                                                               n->model_workspaces_,           //
                                                               draft_token_workspace_manager,  //
                                                               engine_config,                  //
+                                                              model_configs,                  //
                                                               n->trace_recorder_),
                          EngineAction::EagleBatchVerify(
                              n->models_, logit_processor, sampler, n->model_workspaces_,
@@ -179,6 +199,7 @@ class EngineImpl : public Engine {
                                               sampler,               //
                                               n->model_workspaces_,  //
                                               engine_config,         //
+                                              model_configs,         //
                                               n->trace_recorder_),
               EngineAction::BatchDraft(n->models_, logit_processor, sampler, n->model_workspaces_,
                                        draft_token_workspace_manager, n->trace_recorder_,
@@ -194,6 +215,7 @@ class EngineImpl : public Engine {
                                           sampler,               //
                                           n->model_workspaces_,  //
                                           engine_config,         //
+                                          model_configs,         //
                                           n->trace_recorder_),
           EngineAction::BatchDecode(n->models_, logit_processor, sampler, n->trace_recorder_)};
     }
@@ -287,19 +309,23 @@ class EngineImpl : public Engine {
     auto it_waiting =
         std::find(estate_->waiting_queue.begin(), estate_->waiting_queue.end(), request);
 
-    for (const RequestStateEntry& rsentry : rstate->entries) {
-      estate_->id_manager.RecycleId(rsentry->mstates[0]->internal_id);
-    }
     estate_->request_states.erase(request->id);
     if (it_running != estate_->running_queue.end()) {
       // The request to abort is in running queue
       estate_->running_queue.erase(it_running);
 
       for (int i = static_cast<int>(rstate->entries.size()) - 1; i >= 0; --i) {
-        if (rstate->entries[i]->status != RequestStateStatus::kAlive) {
-          continue;
+        if (estate_->prefix_cache->HasSequence(rstate->entries[i]->mstates[0]->internal_id)) {
+          estate_->prefix_cache->RecycleSequence(rstate->entries[i]->mstates[0]->internal_id,
+                                                 /*lazy=*/false);
+        } else {
+          if (rstate->entries[i]->status != RequestStateStatus::kAlive) {
+            estate_->id_manager.RecycleId(rstate->entries[i]->mstates[0]->internal_id);
+            continue;
+          }
+          RemoveRequestFromModel(estate_, rstate->entries[i]->mstates[0]->internal_id, models_);
+          estate_->id_manager.RecycleId(rstate->entries[i]->mstates[0]->internal_id);
         }
-        RemoveRequestFromModel(estate_, rstate->entries[i]->mstates[0]->internal_id, models_);
       }
     }
     if (it_waiting != estate_->waiting_queue.end()) {
@@ -340,7 +366,7 @@ class EngineImpl : public Engine {
       if (!processed_requests.empty()) {
         ActionStepPostProcess(processed_requests, estate_, models_, tokenizer_,
                               request_stream_callback_.value(),
-                              engine_config_->max_single_sequence_length);
+                              engine_config_->max_single_sequence_length, trace_recorder_);
         return;
       }
     }

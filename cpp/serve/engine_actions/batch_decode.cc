@@ -7,7 +7,7 @@
 
 #include <numeric>
 
-#include "../../random.h"
+#include "../../support/random.h"
 #include "../config.h"
 #include "../model.h"
 #include "../sampler/sampler.h"
@@ -47,6 +47,7 @@ class BatchDecodeActionObj : public EngineActionObj {
       NVTXScopedRange nvtx_scope("BatchDecode getting requests");
       running_rsentries = GetRunningRequestStateEntries(estate);
       while (!CanDecode(running_rsentries.size())) {
+        if (estate->prefix_cache->TryFreeMemory()) continue;
         RequestStateEntry preempted =
             PreemptLastRunningRequestStateEntry(estate, models_, NullOpt, trace_recorder_);
         if (preempted.same_as(running_rsentries.back())) {
@@ -60,7 +61,8 @@ class BatchDecodeActionObj : public EngineActionObj {
     // NOTE: Right now we only support decode all the running request states at a time.
     int num_rsentries = running_rsentries.size();
     ICHECK_GT(num_rsentries, 0)
-        << "There should be at least one request state entry that can run decode";
+        << "There should be at least one request state entry that can run decode. "
+           "Possible failure reason: none of the prefill phase of the running requests is finished";
     // Collect
     // - the last committed token,
     // - the request id,

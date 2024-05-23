@@ -27,7 +27,7 @@ It can also be a link to a HF repository pointing to an MLC compiled model.
 """.strip(),
     "model_lib": """
 The full path to the model library file to use (e.g. a ``.so`` file). If unspecified, we will use
-the provided ``model`` to search over possible paths. It the model lib is not found, it will be 
+the provided ``model`` to search over possible paths. It the model lib is not found, it will be
 compiled in a JIT manner.
 """.strip(),
     "model_type": """
@@ -154,9 +154,9 @@ It should not exceed the prefill chunk size in model config.
 If not specified, this defaults to the prefill chunk size in model config.
 """.strip(),
     "max_history_size_serve": """
-The maximum history length for rolling back the RNN state. 
+The maximum history length for rolling back the RNN state.
 If unspecified, the default value is 1.
-KV cache does not need this. 
+KV cache does not need this.
 """.strip(),
     "enable_tracing_serve": """
 Enable Chrome Tracing for the server.
@@ -207,6 +207,16 @@ The default mode is "disable".
     "spec_draft_length_serve": """
 The number of draft tokens to generate in speculative proposal. The default values is 4.
 """.strip(),
+    "prefix_cache_mode_serve": """
+The prefix cache mode. Right now two options are supported:
+ - "disable", where prefix cache is not enabled,
+ - "radix", denoting the normal paged radix tree based prefix cache,
+The default mode is "radix".
+""".strip(),
+    "prefix_cache_max_num_recycling_seqs_serve": """
+The maximum number of sequences in prefix cache, default as max_batch_size.
+And set 0 to disable prefix cache, set -1 to have infinite capacity prefix cache.
+""".strip(),
     "engine_config_serve": """
 The MLCEngine execution configuration.
 Currently speculative decoding mode is specified via engine config.
@@ -218,7 +228,7 @@ Check out class `EngineConfig` in mlc_llm/serve/config.py for detailed specifica
 The path to "mlc-package-config.json" which is used for package build.
 See "https://github.com/mlc-ai/mlc-llm/blob/main/ios/MLCChat/mlc-package-config.json" as an example.
 """.strip(),
-    "mlc_llm_home": """
+    "mlc_source_dir": """
 The source code path to MLC LLM.
 """.strip(),
     "output_package": """

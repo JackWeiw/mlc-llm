@@ -11,7 +11,7 @@
 #include <algorithm>
 #include <cmath>
 
-#include "../../random.h"
+#include "../../support/random.h"
 #include "sampler.h"
 
 namespace mlc {
@@ -142,8 +142,8 @@ TokenProbPair SampleTopPFromProb(NDArray prob, int unit_offset, int input_prob_o
       }
       last_cum_sum_prob = it->first;
     }
-    return std::make_pair(data[data.size() - 1].first - last_cum_sum_prob,
-                          data[data.size() - 1].second);
+    return std::make_pair(data[static_cast<int64_t>(data.size()) - 1].first - last_cum_sum_prob,
+                          data[static_cast<int64_t>(data.size()) - 1].second);
   };
 
   if (top_p < 1) {

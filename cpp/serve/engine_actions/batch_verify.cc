@@ -9,7 +9,7 @@
 #include <exception>
 #include <numeric>
 
-#include "../../random.h"
+#include "../../support/random.h"
 #include "../config.h"
 #include "../model.h"
 #include "../sampler/sampler.h"
@@ -249,6 +249,7 @@ class BatchVerifyActionObj : public EngineActionObj {
       total_required_pages += num_require_pages;
     }
     while (!CanVerify(total_required_pages)) {
+      if (estate->prefix_cache->TryFreeMemory()) continue;
       RequestStateEntry preempted = PreemptLastRunningRequestStateEntry(
           estate, models_, draft_token_workspace_manager_, trace_recorder_);
       if (preempted.same_as(running_rsentries.back())) {

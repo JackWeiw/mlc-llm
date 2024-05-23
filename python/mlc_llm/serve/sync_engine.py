@@ -96,6 +96,8 @@ class SyncMLCEngine:
         enable_tracing: bool = False,
         speculative_mode: Literal["disable", "small_draft", "eagle"] = "disable",
         spec_draft_length: int = 4,
+        prefix_cache_mode: Literal["disable", "radix"] = "radix",
+        prefix_cache_max_num_recycling_seqs: Optional[int] = None,
         verbose: bool = True,
         request_stream_callback: Optional[Callable[[List[data.RequestStreamOutput]], None]] = None,
     ):
@@ -152,6 +154,8 @@ class SyncMLCEngine:
                 max_history_size=max_history_size,
                 speculative_mode=speculative_mode,
                 spec_draft_length=spec_draft_length,
+                prefix_cache_mode=prefix_cache_mode,
+                prefix_cache_max_num_recycling_seqs=prefix_cache_max_num_recycling_seqs,
                 verbose=verbose,
             ).asjson(),
             device,
@@ -245,7 +249,7 @@ class SyncMLCEngine:
                 request_id, stream_outputs = delta_output.unpack()
                 rid = int(request_id)
 
-                assert len(stream_outputs) == generation_config[rid].n
+                assert len(stream_outputs) == generation_config[rid].n  # type:ignore
                 for i, (stream_output, text_streamer) in enumerate(
                     zip(stream_outputs, text_streamers[rid])
                 ):

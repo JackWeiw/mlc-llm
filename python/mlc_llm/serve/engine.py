@@ -837,6 +837,15 @@ class AsyncMLCEngine(engine_base.MLCEngineBase):
     spec_draft_length : int
         The number of tokens to generate in speculative proposal (draft).
 
+    prefix_cache_mode : Literal["disable", "radix"]
+        The prefix cache mode.
+        "disable" means no prefix cache is disabled.
+        "radix" means the paged radix tree based prefix cache mode.
+
+    prefix_cache_max_num_recycling_seqs: Optional[int]
+        The maximum number of recycling sequences in prefix cache, default as max_num_sequence.
+        And set 0 to disable prefix cache, set -1 to have infinite capacity prefix cache.
+
     enable_tracing : bool
         A boolean indicating if to enable event logging for requests.
 
@@ -844,7 +853,7 @@ class AsyncMLCEngine(engine_base.MLCEngineBase):
         A boolean indicating whether to print logging info in engine.
     """
 
-    def __init__(  # pylint: disable=too-many-arguments
+    def __init__(  # pylint: disable=too-many-arguments,too-many-locals
         self,
         model: str,
         device: Union[str, Device] = "auto",
@@ -859,6 +868,8 @@ class AsyncMLCEngine(engine_base.MLCEngineBase):
         gpu_memory_utilization: Optional[float] = None,
         speculative_mode: Literal["disable", "small_draft", "eagle", "medusa"] = "disable",
         spec_draft_length: int = 4,
+        prefix_cache_mode: Literal["disable", "radix"] = "radix",
+        prefix_cache_max_num_recycling_seqs: Optional[int] = None,
         enable_tracing: bool = False,
         verbose: bool = True,
     ) -> None:
@@ -876,6 +887,8 @@ class AsyncMLCEngine(engine_base.MLCEngineBase):
             gpu_memory_utilization=gpu_memory_utilization,
             speculative_mode=speculative_mode,
             spec_draft_length=spec_draft_length,
+            prefix_cache_mode=prefix_cache_mode,
+            prefix_cache_max_num_recycling_seqs=prefix_cache_max_num_recycling_seqs,
             enable_tracing=enable_tracing,
             verbose=verbose,
         )
@@ -1415,6 +1428,15 @@ class MLCEngine(engine_base.MLCEngineBase):
     spec_draft_length : int
         The number of tokens to generate in speculative proposal (draft).
 
+    prefix_cache_mode : Literal["disable", "radix"]
+        The prefix cache mode.
+        "disable" means no prefix cache is disabled.
+        "radix" means the paged radix tree based prefix cache mode.
+
+    prefix_cache_max_num_recycling_seqs: Optional[int]
+        The maximum number of recycling sequences in prefix cache, default as max_num_sequence.
+        And set 0 to disable prefix cache, set -1 to have infinite capacity prefix cache.
+
     enable_tracing : bool
         A boolean indicating if to enable event logging for requests.
 
@@ -1422,7 +1444,7 @@ class MLCEngine(engine_base.MLCEngineBase):
         A boolean indicating whether to print logging info in engine.
     """
 
-    def __init__(  # pylint: disable=too-many-arguments
+    def __init__(  # pylint: disable=too-many-arguments,too-many-locals
         self,
         model: str,
         device: Union[str, Device] = "auto",
@@ -1437,6 +1459,8 @@ class MLCEngine(engine_base.MLCEngineBase):
         gpu_memory_utilization: Optional[float] = None,
         speculative_mode: Literal["disable", "small_draft", "eagle"] = "disable",
         spec_draft_length: int = 4,
+        prefix_cache_mode: Literal["disable", "radix"] = "radix",
+        prefix_cache_max_num_recycling_seqs: Optional[int] = None,
         enable_tracing: bool = False,
         verbose: bool = True,
     ) -> None:
@@ -1454,6 +1478,8 @@ class MLCEngine(engine_base.MLCEngineBase):
             gpu_memory_utilization=gpu_memory_utilization,
             speculative_mode=speculative_mode,
             spec_draft_length=spec_draft_length,
+            prefix_cache_mode=prefix_cache_mode,
+            prefix_cache_max_num_recycling_seqs=prefix_cache_max_num_recycling_seqs,
             enable_tracing=enable_tracing,
             verbose=verbose,
         )

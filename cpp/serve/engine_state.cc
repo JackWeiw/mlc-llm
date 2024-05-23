@@ -57,6 +57,9 @@ void EngineStateObj::Reset() {
   request_states.clear();
   id_manager.Reset();
   stats.Reset();
+  if (prefix_cache.defined()) {
+    prefix_cache->Reset();
+  }
 }
 
 RequestState EngineStateObj::GetRequestState(Request request) {

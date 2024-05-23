@@ -2,7 +2,7 @@
 
 import json
 
-from mlc_llm.help import HELP
+from mlc_llm.interface.help import HELP
 from mlc_llm.interface.serve import serve
 from mlc_llm.support.argparse import ArgumentParser
 
@@ -57,6 +57,18 @@ def main(argv):
     parser.add_argument(
         "--spec-draft-length", type=int, default=4, help=HELP["spec_draft_length_serve"]
     )
+    parser.add_argument(
+        "--prefix-cache-mode",
+        type=str,
+        choices=["disable", "radix"],
+        default="radix",
+        help=HELP["prefix_cache_mode_serve"] + ' (default: "%(default)s")',
+    )
+    parser.add_argument(
+        "--prefix-cache-max-num-recycling-seqs",
+        type=int,
+        help=HELP["prefix_cache_max_num_recycling_seqs_serve"],
+    )
     parser.add_argument("--enable-tracing", action="store_true", help=HELP["enable_tracing_serve"])
     parser.add_argument(
         "--host",
@@ -104,6 +116,8 @@ def main(argv):
         gpu_memory_utilization=parsed.gpu_memory_utilization,
         speculative_mode=parsed.speculative_mode,
         spec_draft_length=parsed.spec_draft_length,
+        prefix_cache_mode=parsed.prefix_cache_mode,
+        prefix_cache_max_num_recycling_seqs=parsed.prefix_cache_max_num_recycling_seqs,
         enable_tracing=parsed.enable_tracing,
         host=parsed.host,
         port=parsed.port,

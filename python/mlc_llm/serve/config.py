@@ -30,6 +30,20 @@ class ResponseFormat:
 
 
 @dataclass
+class DebugConfig:
+    """The debug configuration dataclass.Parameters
+    ----------
+
+    pinned_system_prompt : bool
+        Whether the input and generated data pinned in engine. Default is set to False.
+        This can be used for system prompt or other purpose, if the data is aimed to be
+        kept all the time.
+    """
+
+    pinned_system_prompt: bool = False
+
+
+@dataclass
 class GenerationConfig:  # pylint: disable=too-many-instance-attributes
     """The generation configuration dataclass.
 
@@ -93,6 +107,9 @@ class GenerationConfig:  # pylint: disable=too-many-instance-attributes
 
     response_format : ResponseFormat
         The response format of the generation output.
+
+    debug_config : Optional[DebugConfig]
+        The optional debug configuration.
     """
 
     n: int = 1
@@ -112,6 +129,8 @@ class GenerationConfig:  # pylint: disable=too-many-instance-attributes
     ignore_eos: bool = False
 
     response_format: ResponseFormat = field(default_factory=ResponseFormat)
+
+    debug_config: Optional[DebugConfig] = field(default_factory=DebugConfig)
 
     def asjson(self) -> str:
         """Return the config in string of JSON format."""
@@ -204,6 +223,15 @@ class EngineConfig:  # pylint: disable=too-many-instance-attributes
     spec_draft_length : int
         The number of tokens to generate in speculative proposal (draft).
 
+    prefix_cache_mode : Literal["disable", "radix"]
+        The prefix cache mode.
+        "disable" means no prefix cache is disabled.
+        "radix" means the paged radix tree based prefix cache mode.
+
+    prefix_cache_max_num_recycling_seqs: Optional[int]
+        The maximum number of recycling sequences in prefix cache, default as max_num_sequence.
+        And set 0 to disable prefix cache, set -1 to have infinite capacity prefix cache.
+
     verbose : bool
         A boolean indicating whether to print logging info in engine.
     """
@@ -223,6 +251,8 @@ class EngineConfig:  # pylint: disable=too-many-instance-attributes
     kv_state_kind: Optional[Literal["kv_cache", "rnn_state"]] = None
     speculative_mode: Literal["disable", "small_draft", "eagle", "medusa"] = "disable"
     spec_draft_length: int = 4
+    prefix_cache_mode: Literal["disable", "radix"] = "radix"
+    prefix_cache_max_num_recycling_seqs: Optional[int] = None
     verbose: bool = True
 
     def asjson(self) -> str:

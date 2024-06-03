@@ -1,5 +1,6 @@
 """This file specifies how MLC's Llama parameters are quantized using group quantization
 or other formats."""
+
 from typing import Tuple
 
 from tvm.relax.frontend import nn
@@ -87,5 +88,6 @@ def per_tensor_quant(
         model,
         quant_map,
         "",
+        tensor_parallel_shards=model_config.tensor_parallel_shards,
     )
     return model, quant_map

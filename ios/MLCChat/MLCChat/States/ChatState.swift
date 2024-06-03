@@ -124,9 +124,11 @@ final class ChatState: ObservableObject {
                 ChatCompletionMessage(role: .user, content: prompt)
             )
             var finishReasonLength = false
+            var finalUsageTextLabel = ""
 
             for await res in await engine.chat.completions.create(
-                messages: self.historyMessages
+                messages: self.historyMessages,
+                stream_options: StreamOptions(include_usage: true)
             ) {
                 for choice in res.choices {
                     if let content = choice.delta.content {
@@ -137,6 +139,9 @@ final class ChatState: ObservableObject {
                             finishReasonLength = true
                         }
                     }
+                }
+                if let finalUsage = res.usage {
+                    finalUsageTextLabel = finalUsage.extra?.asTextLabel() ?? ""
                 }
                 if getModelChatState() != .generating {
                     break
@@ -174,8 +179,7 @@ final class ChatState: ObservableObject {
             }
 
             if getModelChatState() == .generating {
-                // TODO(mlc-team) add stats
-                let runtimStats = ""
+                let runtimStats = finalUsageTextLabel
 
                 DispatchQueue.main.async {
                     self.infoText = runtimStats
@@ -270,7 +274,7 @@ private extension ChatState {
 
     func mainResetChat() {
         Task {
-            engine.reset()
+            await engine.reset()
             self.historyMessages = []
             self.streamingText = ""
 
@@ -283,7 +287,7 @@ private extension ChatState {
 
     func mainTerminateChat(callback: @escaping () -> Void) {
         Task {
-            engine.unload()
+            await engine.unload()
             DispatchQueue.main.async {
                 self.clearHistory()
                 self.modelID = ""
@@ -309,7 +313,7 @@ private extension ChatState {
                 self.appendMessage(role: .assistant, message: "[System] Initalize...")
             }
 
-            engine.unload()
+            await engine.unload()
             let vRAM = os_proc_available_memory()
             if (vRAM < estimatedVRAMReq) {
                 let requiredMemory = String (
@@ -325,7 +329,9 @@ private extension ChatState {
                 }
                 return
             }
-            engine.reload(modelPath: modelPath, modelLib: modelLib)
+            await engine.reload(
+                modelPath: modelPath, modelLib: modelLib
+            )
 
             // run a simple prompt with empty content to warm up system prompt
             // helps to start things before user start typing

@@ -54,23 +54,28 @@ class GPUSampler : public SamplerObj {
     flashinfer_multinomial_sample_func_ =
         Registry::Get("flashinfer.sampling.parallel_sampling_from_prob");
 
-    DLDevice device_cpu{DLDeviceType::kDLCPU, /*device_id=*/0};
+    Device preferred_host_device = GetPreferredHostDevice(device);
     // We support at most 5 top prob results for each sequence.
     // Initialize auxiliary arrays on CPU.
-    uniform_samples_host_ = NDArray::Empty({max_num_sample}, dtype_f32_, device_cpu);
-    sample_indices_host_ = NDArray::Empty({max_num_sample}, dtype_i32_, device_cpu);
-    top_p_host_ = NDArray::Empty({max_num_sample}, dtype_f32_, device_cpu);
-    top_p_init_pivots_host_ =
-        NDArray::Empty({max_num_sample, num_top_p_cutoff_pivots_}, dtype_f32_, device_cpu);
-    top_prob_offsets_host_ = NDArray::Empty({max_num_sample * 5}, dtype_i32_, device_cpu);
-    draft_tokens_host_ = NDArray::Empty({max_num_sample}, dtype_i32_, device_cpu);
-    token_tree_first_child_host_ = NDArray::Empty({max_num_sample}, dtype_i32_, device_cpu);
-    token_tree_next_sibling_host_ = NDArray::Empty({max_num_sample}, dtype_i32_, device_cpu);
-    token_tree_parent_ptr_host_ = NDArray::Empty({max_num_sample}, dtype_i32_, device_cpu);
-    sampled_token_ids_host_ = NDArray::Empty({max_num_sample}, dtype_i32_, device_cpu);
-    sampled_probs_host_ = NDArray::Empty({max_num_sample}, dtype_f32_, device_cpu);
-    top_prob_probs_host_ = NDArray::Empty({max_num_sample * 5}, dtype_f32_, device_cpu);
-    top_prob_indices_host_ = NDArray::Empty({max_num_sample * 5}, dtype_i32_, device_cpu);
+    uniform_samples_host_ = NDArray::Empty({max_num_sample}, dtype_f32_, preferred_host_device);
+    sample_indices_host_ = NDArray::Empty({max_num_sample}, dtype_i32_, preferred_host_device);
+    top_p_host_ = NDArray::Empty({max_num_sample}, dtype_f32_, preferred_host_device);
+    top_p_init_pivots_host_ = NDArray::Empty({max_num_sample, num_top_p_cutoff_pivots_}, dtype_f32_,
+                                             preferred_host_device);
+    top_prob_offsets_host_ =
+        NDArray::Empty({max_num_sample * 5}, dtype_i32_, preferred_host_device);
+    draft_tokens_host_ = NDArray::Empty({max_num_sample}, dtype_i32_, preferred_host_device);
+    token_tree_first_child_host_ =
+        NDArray::Empty({max_num_sample}, dtype_i32_, preferred_host_device);
+    token_tree_next_sibling_host_ =
+        NDArray::Empty({max_num_sample}, dtype_i32_, preferred_host_device);
+    token_tree_parent_ptr_host_ =
+        NDArray::Empty({max_num_sample}, dtype_i32_, preferred_host_device);
+    sampled_token_ids_host_ = NDArray::Empty({max_num_sample}, dtype_i32_, preferred_host_device);
+    sampled_probs_host_ = NDArray::Empty({max_num_sample}, dtype_f32_, preferred_host_device);
+    top_prob_probs_host_ = NDArray::Empty({max_num_sample * 5}, dtype_f32_, preferred_host_device);
+    top_prob_indices_host_ =
+        NDArray::Empty({max_num_sample * 5}, dtype_i32_, preferred_host_device);
     // Initialize auxiliary arrays on GPU.
     uniform_samples_device_ = NDArray::Empty({max_num_sample}, dtype_f32_, device);
     sample_indices_device_ = NDArray::Empty({max_num_sample}, dtype_i32_, device);
@@ -545,7 +550,8 @@ class GPUSampler : public SamplerObj {
     if (!need_top_p && !need_prob_values) {
       // - Short path: If top_p and prob values are not needed, we directly sample from multinomial.
       SyncCopyStream(device_, compute_stream_, copy_stream_);
-      if (flashinfer_multinomial_sample_func_ != nullptr) {
+      if (device_.device_type == DLDeviceType::kDLCUDA &&
+          flashinfer_multinomial_sample_func_ != nullptr) {
         sampled_token_ids_device =
             sampled_token_ids_device_.CreateView({sample_indices_device->shape[0]}, dtype_i32_);
         (*flashinfer_multinomial_sample_func_)(probs_on_device, uniform_samples_device,
@@ -588,7 +594,8 @@ class GPUSampler : public SamplerObj {
                                       uniform_samples_device, sample_indices_device, top_p_device);
     } else {
       // - Sample without top_p.
-      if (flashinfer_multinomial_sample_func_ != nullptr) {
+      if (device_.device_type == DLDeviceType::kDLCUDA &&
+          flashinfer_multinomial_sample_func_ != nullptr) {
         sampled_token_ids_device =
             sampled_token_ids_device_.CreateView({sample_indices_device->shape[0]}, dtype_i32_);
         (*flashinfer_multinomial_sample_func_)(probs_on_device, uniform_samples_device,

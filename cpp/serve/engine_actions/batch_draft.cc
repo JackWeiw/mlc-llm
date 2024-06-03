@@ -25,12 +25,14 @@ class BatchDraftActionObj : public EngineActionObj {
   explicit BatchDraftActionObj(Array<Model> models, LogitProcessor logit_processor, Sampler sampler,
                                std::vector<ModelWorkspace> model_workspaces,
                                DraftTokenWorkspaceManager draft_token_workspace_manager,
+                               EngineConfig engine_config,
                                Optional<EventTraceRecorder> trace_recorder, int draft_length)
       : models_(std::move(models)),
         logit_processor_(std::move(logit_processor)),
         sampler_(std::move(sampler)),
         model_workspaces_(std::move(model_workspaces)),
         draft_token_workspace_manager_(std::move(draft_token_workspace_manager)),
+        engine_config_(std::move(engine_config)),
         trace_recorder_(std::move(trace_recorder)),
         draft_length_(draft_length) {
     ICHECK_GT(draft_length_, 0);
@@ -56,6 +58,13 @@ class BatchDraftActionObj : public EngineActionObj {
     auto tstart = std::chrono::high_resolution_clock::now();
 
     int num_rsentries = running_rsentries.size();
+    ICHECK_GT(num_rsentries, 0)
+        << "There should be at least one request state entry that can run decode. "
+           "Possible failure reason: none of the prefill phase of the running requests is finished";
+    ICHECK_LE(num_rsentries, engine_config_->max_num_sequence)
+        << "The number of running requests exceeds the max number of sequence in EngineConfig. "
+           "Possible failure reason: the prefill action allows new sequence in regardless of the "
+           "max num sequence.";
     Array<String> request_ids;
     std::vector<int64_t> request_internal_ids;
     Array<GenerationConfig> generation_cfg;
@@ -85,6 +94,7 @@ class BatchDraftActionObj : public EngineActionObj {
       }
       // draft_length_ rounds of draft proposal.
       for (int draft_id = 0; draft_id < draft_length_; ++draft_id) {
+        auto tdraft_start = std::chrono::high_resolution_clock::now();
         // prepare new input tokens
         input_tokens.clear();
         for (int i = 0; i < num_rsentries; ++i) {
@@ -133,13 +143,16 @@ class BatchDraftActionObj : public EngineActionObj {
                                              &model_workspaces_[0].draft_probs_storage);
         for (int i = 0; i < num_rsentries; ++i) {
           mstates[i]->AddDraftToken(sample_results[i], draft_token_slots_[i]);
-          estate->stats.total_draft_length += 1;
         }
+
+        auto tdraft_end = std::chrono::high_resolution_clock::now();
+        estate->metrics.UpdateDraftTimeByBatchSize(
+            num_rsentries, static_cast<double>((tdraft_end - tdraft_start).count()) / 1e9);
       }
     }
 
     auto tend = std::chrono::high_resolution_clock::now();
-    estate->stats.engine_total_decode_time += static_cast<double>((tend - tstart).count()) / 1e9;
+    estate->metrics.engine_decode_time_sum += static_cast<double>((tend - tstart).count()) / 1e9;
 
     return {};
   }
@@ -168,6 +181,8 @@ class BatchDraftActionObj : public EngineActionObj {
   std::vector<ModelWorkspace> model_workspaces_;
   /*! \brief The draft token workspace manager. */
   DraftTokenWorkspaceManager draft_token_workspace_manager_;
+  /*! \brief The engine config. */
+  EngineConfig engine_config_;
   /*! \brief Event trace recorder. */
   Optional<EventTraceRecorder> trace_recorder_;
   /*! \brief Draft proposal length */
@@ -179,12 +194,13 @@ class BatchDraftActionObj : public EngineActionObj {
 EngineAction EngineAction::BatchDraft(Array<Model> models, LogitProcessor logit_processor,
                                       Sampler sampler, std::vector<ModelWorkspace> model_workspaces,
                                       DraftTokenWorkspaceManager draft_token_workspace_manager,
+                                      EngineConfig engine_config,
                                       Optional<EventTraceRecorder> trace_recorder,
                                       int draft_length) {
   return EngineAction(make_object<BatchDraftActionObj>(
       std::move(models), std::move(logit_processor), std::move(sampler),
       std::move(model_workspaces), std::move(draft_token_workspace_manager),
-      std::move(trace_recorder), draft_length));
+      std::move(engine_config), std::move(trace_recorder), draft_length));
 }
 
 }  // namespace serve

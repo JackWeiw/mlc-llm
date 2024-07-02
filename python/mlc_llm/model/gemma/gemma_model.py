@@ -22,7 +22,6 @@ class GemmaConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
     """Configuration of the Gemma model."""
 
     hidden_size: int
-    hidden_act: str
     intermediate_size: int
     attention_bias: bool
     num_attention_heads: int
@@ -31,6 +30,7 @@ class GemmaConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
     num_hidden_layers: int
     rms_norm_eps: float
     vocab_size: int
+    hidden_activation: Optional[str] = None
     position_embedding_base: int = 0
     context_window_size: int = 0
     prefill_chunk_size: int = 0
@@ -39,7 +39,9 @@ class GemmaConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
     kwargs: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self):
-        if self.hidden_act not in ("gelu", "gelu_pytorch_tanh"):
+        if self.hidden_activation is None:
+            self.hidden_activation = self.kwargs.get("hidden_act", None)
+        if self.hidden_activation not in ("gelu", "gelu_pytorch_tanh"):
             raise ValueError("Only GeLU is supported as the activation for gemma.")
         if self.attention_bias:
             raise ValueError('Only "False" attention_bias is supported for gemma')
